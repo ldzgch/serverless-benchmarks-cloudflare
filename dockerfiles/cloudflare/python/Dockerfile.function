@@ -1,0 +1,23 @@
+# Use a standard Python slim image
+FROM python:3.10-slim
+
+WORKDIR /app
+
+# Copy benchmark requirements
+COPY requirements.txt ./
+
+# Add Flask (our web server) to the requirements
+# Then install all dependencies in one layer
+RUN echo "flask" >> requirements.txt && \
+    pip install --no-cache-dir -r requirements.txt
+
+# Copy all benchmark code (handler.py, etc.)
+# AND the server.py wrapper (which package_code will have copied)
+COPY . .
+
+# Set the port the container will listen on
+ENV PORT 8080
+EXPOSE 8080
+
+# Run the web server wrapper, NOT the handler
+CMD ["python", "server.py"]

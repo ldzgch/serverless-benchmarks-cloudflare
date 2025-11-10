@@ -4,17 +4,20 @@ import json
 from typing import cast, Dict, List, Optional, Tuple, Type
 
 import docker
+import subprocess  # <-- ADD THIS
 import requests
 
 from sebs.cloudflare.config import CloudflareConfig
 from sebs.cloudflare.function import CloudflareWorker
 from sebs.cloudflare.resources import CloudflareSystemResources
+from sebs.cloudflare.container import CloudflareContainer
 from sebs.benchmark import Benchmark
 from sebs.cache import Cache
 from sebs.config import SeBSConfig
 from sebs.utils import LoggingHandlers
 from sebs.faas.function import Function, ExecutionResult, Trigger, FunctionConfig
 from sebs.faas.system import System
+
 
 
 class Cloudflare(System):
@@ -26,6 +29,7 @@ class Cloudflare(System):
     """
     
     _config: CloudflareConfig
+    container_client: CloudflareContainer
 
     @staticmethod
     def name():
@@ -60,6 +64,9 @@ class Cloudflare(System):
         self.logging_handlers = logger_handlers
         self._config = config
         self._api_base_url = "https://api.cloudflare.com/client/v4"
+        self.container_client = CloudflareContainer(
+            sebs_config, config, docker_client
+        )
 
     def initialize(self, config: Dict[str, str] = {}, resource_prefix: Optional[str] = None):
         """
@@ -113,71 +120,84 @@ class Cloudflare(System):
     ) -> Tuple[str, int, str]:
         """
         Package code for Cloudflare Workers deployment.
+
+        If container_deployment is True, builds and pushes a Docker image
+        using wrangler and returns the image URI.
         
-        Cloudflare Workers support JavaScript/TypeScript and use a bundler
-        to create a single JavaScript file for deployment.
-        
-        Args:
-            directory: Path to the code directory
-            language_name: Programming language name
-            language_version: Programming language version
-            architecture: Target architecture (not used for Workers)
-            benchmark: Benchmark name
-            is_cached: Whether the code is cached
-            container_deployment: Whether to deploy as container (not supported)
-            
-        Returns:
-            Tuple of (package_path, package_size, container_uri)
+        If container_deployment is False, prepares the single script file
+        for 'script' deployment.
         """
+        
         if container_deployment:
-            raise NotImplementedError(
-                "Container deployment is not supported for Cloudflare Workers"
+            
+            SERVER_FILES = {
+                "python": "server.py",
+                "nodejs": "server.js",
+            }
+
+            if language_name not in SERVER_FILES:
+                raise NotImplementedError(
+                    f"Container deployment for {language_name} is not supported."
+                )
+
+            # 1. Copy the language-specific web server wrapper
+            server_wrapper_name = SERVER_FILES[language_name]
+            sebs_template_dir = self.sebs_config.templates_dir
+            
+            server_wrapper_src = os.path.join(
+                sebs_template_dir, "cloudflare", language_name, server_wrapper_name
+            )
+            server_wrapper_dst = os.path.join(directory, server_wrapper_name)
+
+            if not os.path.exists(server_wrapper_src):
+                raise RuntimeError(f"Missing server wrapper template at {server_wrapper_src}")
+            
+            shutil.copy2(server_wrapper_src, server_wrapper_dst)
+            self.logging.info(f"Copied {server_wrapper_name} to build directory.")
+
+            # 2. Build and push the image using the container client
+            #    build_base_image is inherited from DockerContainer
+            #    It will find the Dockerfile, build, check cache, and push
+            _, container_uri = self.container_client.build_base_image(
+                directory,
+                language_name,
+                language_version,
+                architecture,
+                benchmark,
+                is_cached,
             )
 
-        # For now, we'll create a simple package structure
-        # In a full implementation, you'd use a bundler like esbuild or webpack
-        
-        CONFIG_FILES = {
-            "nodejs": ["handler.js", "package.json", "node_modules"],
-            # Python support via Python Workers is limited
-            "python": ["handler.py", "requirements.txt"],
-        }
-        
-        if language_name not in CONFIG_FILES:
-            raise NotImplementedError(
-                f"Language {language_name} is not yet supported for Cloudflare Workers"
-            )
+            # For containers, the "package_path" is the build directory
+            # and size is not relevant.
+            return (directory, 0, container_uri)
 
-        package_config = CONFIG_FILES[language_name]
-        
-        # Create a worker directory with the necessary files
-        worker_dir = os.path.join(directory, "worker")
-        os.makedirs(worker_dir, exist_ok=True)
-        
-        # Copy all files to worker directory
-        for file in os.listdir(directory):
-            if file not in package_config and file != "worker":
-                src = os.path.join(directory, file)
-                dst = os.path.join(worker_dir, file)
-                if os.path.isfile(src):
-                    shutil.copy2(src, dst)
-                elif os.path.isdir(src):
-                    shutil.copytree(src, dst, dirs_exist_ok=True)
-        
-        # For now, return the main handler file as the package
-        handler_file = "handler.js" if language_name == "nodejs" else "handler.py"
-        package_path = os.path.join(directory, handler_file)
-        
-        if not os.path.exists(package_path):
-            raise RuntimeError(f"Handler file {handler_file} not found in {directory}")
-        
-        bytes_size = os.path.getsize(package_path)
-        mbytes = bytes_size / 1024.0 / 1024.0
-        self.logging.info(f"Worker package size: {mbytes:.2f} MB")
+        else:
+            # Original logic for script-based deployment
+            CONFIG_FILES = {
+                "nodejs": "handler.js",
+                "python": "handler.py",
+            }
 
-        return (package_path, bytes_size, "")
+            if language_name not in CONFIG_FILES:
+                raise NotImplementedError(
+                    f"Language {language_name} is not yet supported for "
+                    "script-based Cloudflare Workers"
+                )
 
-    def create_function(
+            # For script-based workers, the "package" is just the handler file itself.
+            handler_file = CONFIG_FILES[language_name]
+            package_path = os.path.join(directory, handler_file)
+
+            if not os.path.exists(package_path):
+                raise RuntimeError(f"Handler file {handler_file} not found in {directory}")
+
+            bytes_size = os.path.getsize(package_path)
+            mbytes = bytes_size / 1024.0 / 1024.0
+            self.logging.info(f"Worker script package size: {mbytes:.2f} MB")
+
+            return (package_path, bytes_size, "")
+        
+    def create_function_old(
         self,
         code_package: Benchmark,
         func_name: str,
@@ -266,6 +286,110 @@ class Cloudflare(System):
 
         return worker
 
+    def create_function(
+        self,
+        code_package: Benchmark,
+        func_name: str,
+        container_deployment: bool,
+        container_uri: str,
+    ) -> CloudflareWorker:
+        """
+        Create a new Cloudflare Worker (either script or container-based).
+        
+        If a worker with the same name already exists, it will be updated.
+        """
+        
+        language_runtime = code_package.language_version
+        function_cfg = FunctionConfig.from_benchmark(code_package)
+        
+        func_name = self.format_function_name(func_name)
+        account_id = self.config.credentials.account_id
+        
+        if not account_id:
+            raise RuntimeError("Cloudflare account ID is required to create workers")
+
+        worker = None
+        
+        if container_deployment:
+            # ---- CONTAINER DEPLOYMENT ----
+            # We must update/deploy every time for containers,
+            # as we can't easily check the deployed image URI.
+            self.logging.info(f"Creating/Updating container worker {func_name}")
+            build_dir = code_package.code_location
+            
+            if not container_uri:
+                 raise RuntimeError("container_uri is required for container deployment")
+
+            self._deploy_container_worker(func_name, build_dir, container_uri)
+            
+            worker = CloudflareWorker(
+                func_name,
+                code_package.benchmark,
+                func_name,
+                code_package.hash,
+                language_runtime,
+                function_cfg,
+                account_id,
+            )
+            worker.updated_code = True # We always update containers
+
+        else:
+            # ---- SCRIPT DEPLOYMENT (Original Logic) ----
+            package = code_package.code_location
+            
+            # Check if worker already exists
+            existing_worker = self._get_worker(func_name, account_id)
+            
+            if existing_worker:
+                self.logging.info(f"Worker {func_name} already exists, updating it")
+                worker = CloudflareWorker(
+                    func_name,
+                    code_package.benchmark,
+                    func_name,  # script_id is the same as name
+                    code_package.hash,
+                    language_runtime,
+                    function_cfg,
+                    account_id,
+                )
+                self.update_function(worker, code_package, container_deployment, container_uri)
+                worker.updated_code = True
+            else:
+                self.logging.info(f"Creating new worker {func_name}")
+                
+                # Read the worker script
+                with open(package, 'r') as f:
+                    script_content = f.read()
+                
+                # Create the worker
+                # Use the RENAMED method here
+                self._deploy_script_worker(func_name, script_content, account_id)
+                
+                worker = CloudflareWorker(
+                    func_name,
+                    code_package.benchmark,
+                    func_name,
+                    code_package.hash,
+                    language_runtime,
+                    function_cfg,
+                    account_id,
+                )
+
+        # ---- COMMON LOGIC ----
+        # Add LibraryTrigger and HTTPTrigger
+        from sebs.cloudflare.triggers import LibraryTrigger, HTTPTrigger
+        
+        library_trigger = LibraryTrigger(func_name, self)
+        library_trigger.logging_handlers = self.logging_handlers
+        worker.add_trigger(library_trigger)
+        
+        # Cloudflare Workers are automatically accessible via HTTPS
+        # This URL pattern works for both scripts and containers
+        worker_url = f"https://{func_name}.{self.config.credentials.workers_dev_domain}"
+        http_trigger = HTTPTrigger(func_name, worker_url)
+        http_trigger.logging_handlers = self.logging_handlers
+        worker.add_trigger(http_trigger)
+
+        return worker
     def _get_worker(self, worker_name: str, account_id: str) -> Optional[dict]:
         """Get information about an existing worker."""
         headers = self._get_auth_headers()
@@ -282,6 +406,30 @@ class Cloudflare(System):
                 f"Failed to check worker existence: {response.status_code} - {response.text}"
             )
 
+    def _deploy_script_worker(
+        self, worker_name: str, script_content: str, account_id: str
+    ) -> dict:
+        """Create or update a Cloudflare Worker."""
+        headers = self._get_auth_headers()
+        # Remove Content-Type as we're sending form data
+        headers.pop("Content-Type", None)
+        
+        url = f"{self._api_base_url}/accounts/{account_id}/workers/scripts/{worker_name}"
+        
+        # Cloudflare Workers API expects the script as form data
+        files = {
+            'script': ('worker.js', script_content, 'application/javascript'),
+        }
+        
+        response = requests.put(url, headers=headers, files=files)
+        
+        if response.status_code not in [200, 201]:
+            raise RuntimeError(
+                f"Failed to create/update worker: {response.status_code} - {response.text}"
+            )
+        
+        return response.json().get("result", {})
+    
     def _create_or_update_worker(
         self, worker_name: str, script_content: str, account_id: str
     ) -> dict:
@@ -324,7 +472,7 @@ class Cloudflare(System):
         for trigger in function.triggers(Trigger.TriggerType.HTTP):
             trigger.logging_handlers = self.logging_handlers
 
-    def update_function(
+    def update_function_old(
         self,
         function: Function,
         code_package: Benchmark,
@@ -359,6 +507,48 @@ class Cloudflare(System):
         
         self._create_or_update_worker(worker.name, script_content, account_id)
         self.logging.info(f"Updated worker {worker.name}")
+        
+        # Update configuration if needed
+        self.update_function_configuration(worker, code_package)
+
+    def update_function(
+        self,
+        function: Function,
+        code_package: Benchmark,
+        container_deployment: bool,
+        container_uri: str,
+    ):
+        """
+        Update an existing Cloudflare Worker.
+        """
+        
+        worker = cast(CloudflareWorker, function)
+        account_id = worker.account_id or self.config.credentials.account_id
+        if not account_id:
+            raise RuntimeError("Account ID is required to update worker")
+
+        if container_deployment:
+            # ---- CONTAINER UPDATE ----
+            self.logging.info(f"Updating container worker {worker.name}")
+            build_dir = code_package.code_location
+            
+            if not container_uri:
+                 raise RuntimeError("container_uri is required for container deployment")
+
+            self._deploy_container_worker(worker.name, build_dir, container_uri)
+            self.logging.info(f"Updated container worker {worker.name}")
+
+        else:
+            # ---- SCRIPT UPDATE (Original Logic) ----
+            package = code_package.code_location
+            
+            # Read the updated script
+            with open(package, 'r') as f:
+                script_content = f.read()
+            
+            # Update the worker using the RENAMED method
+            self._deploy_script_worker(worker.name, script_content, account_id)
+            self.logging.info(f"Updated script worker {worker.name}")
         
         # Update configuration if needed
         self.update_function_configuration(worker, code_package)
@@ -589,6 +779,89 @@ class Cloudflare(System):
                 "Client-side timing data is still available."
             )
 
+    def _deploy_container_worker(
+        self, worker_name: str, build_dir: str, container_uri: str
+    ):
+        """
+        Deploys a container-based worker using `wrangler`.
+        
+        This function generates a loader script and a wrangler.toml,
+        then executes `wrangler deploy`.
+
+        Args:
+            worker_name: The name for the worker.
+            build_dir: The build context directory (where Dockerfile is).
+            container_uri: The full URI of the pushed container image.
+        """
+        self.logging.info(f"Deploying container {container_uri} to worker {worker_name}")
+
+        # 1. Generate wrangler.toml
+        #    Note: We use a fixed compatibility date. This could be configurable.
+        toml_content = f"""
+name = "{worker_name}"
+main = "loader.js"
+compatibility_date = "2024-05-01"
+
+[[containers]]
+binding = "MY_CONTAINER"
+image = "{container_uri}"
+"""
+        toml_path = os.path.join(build_dir, "wrangler.toml")
+        with open(toml_path, "w") as f:
+            f.write(toml_content)
+
+        # 2. Generate loader.js entrypoint script
+        #    This script forwards requests to the container.
+        loader_content = """
+export default {
+  async fetch(request, env, ctx) {
+    // getByName("instance") creates/gets a proxy to the container instance
+    const container = env.MY_CONTAINER.getByName("instance");
+    // Forward the original request to the container
+    return container.fetch(request);
+  },
+};
+"""
+        loader_path = os.path.join(build_dir, "loader.js")
+        with open(loader_path, "w") as f:
+            f.write(loader_content)
+        
+        # 3. Get API token for wrangler
+        api_token = self.config.credentials.api_token
+        if not api_token:
+            raise RuntimeError("Cloudflare API token is required to deploy with wrangler.")
+
+        push_env = os.environ.copy()
+        push_env["CLOUDFLARE_API_TOKEN"] = api_token
+
+        cmd = ["wrangler", "deploy"]
+        
+        try:
+            process = subprocess.run(
+                cmd,
+                env=push_env,
+                cwd=build_dir, # Run from the build directory
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+            )
+            self.logging.info(f"Wrangler deploy stdout: {process.stdout}")
+            self.logging.info(f"Successfully deployed container worker {worker_name}")
+
+        except subprocess.CalledProcessError as e:
+            self.logging.error(f"Failed to deploy container worker {worker_name} with wrangler.")
+            self.logging.error(f"Wrangler return code: {e.returncode}")
+            self.logging.error(f"Wrangler stdout: {e.stdout}")
+            self.logging.error(f"Wrangler stderr: {e.stderr}")
+            raise RuntimeError(f"Wrangler deploy failed: {e.stderr}")
+        except FileNotFoundError:
+            self.logging.error("`wrangler` command not found.")
+            raise RuntimeError(
+                "`wrangler` CLI is not installed or not in PATH. "
+                "It is required for Cloudflare container operations."
+            )
+
     def _query_analytics_engine(
         self, 
         account_id: str, 
@@ -721,3 +994,46 @@ class Cloudflare(System):
             self.config.update_cache(self.cache_client)
         finally:
             self.cache_client.unlock()
+
+
+    def delete_function(self, function: Function):
+        """
+        Delete a Cloudflare Worker.
+
+        Args:
+            function: The function to delete
+        """
+        worker = cast(CloudflareWorker, function)
+        worker_name = worker.name
+        account_id = worker.account_id or self.config.credentials.account_id
+
+        if not account_id:
+            self.logging.error(f"Account ID is required to delete worker {worker_name}")
+            raise RuntimeError(f"Account ID is required to delete worker {worker_name}")
+
+        self.logging.info(f"Deleting worker {worker_name}")
+
+        headers = self._get_auth_headers()
+        url = f"{self._api_base_url}/accounts/{account_id}/workers/scripts/{worker_name}"
+
+        try:
+            response = requests.delete(url, headers=headers, timeout=10)
+
+            # 200 OK (with result) or 204 No Content (no result) are both success
+            if response.status_code in [200, 204]:
+                self.logging.info(f"Successfully deleted worker {worker_name}")
+            elif response.status_code == 404:
+                self.logging.warning(
+                    f"Worker {worker_name} not found during deletion, "
+                    "assuming it was already deleted."
+                )
+            else:
+                # Raise an error for other unexpected statuses
+                raise RuntimeError(
+                    f"Failed to delete worker {worker_name}: "
+                    f"{response.status_code} - {response.text}"
+                )
+
+        except requests.exceptions.RequestException as e:
+            self.logging.error(f"Network error while deleting worker {worker_name}: {e}")
+            raise RuntimeError(f"Error deleting worker {worker_name}") from e
