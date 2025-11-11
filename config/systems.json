@@ -335,9 +335,7 @@
             "3.12": "ubuntu:22.04"
           }
         },
-        "images": [
-          "build"
-        ],
+        "images": [],
         "deployment": {
           "files": [
             "handler.py",
@@ -355,13 +353,13 @@
             "20": "ubuntu:22.04"
           }
         },
-        "images": [
-          "build"
-        ],
+        "images": [],
         "deployment": {
           "files": [
             "handler.js",
-            "storage.js"
+            "storage.js",
+            "fs-polyfill.js",
+            "path-polyfill.js"
           ],
           "packages": {
             "uuid": "3.4.0"
