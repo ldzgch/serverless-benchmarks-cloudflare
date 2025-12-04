@@ -59,7 +59,6 @@ class BenchmarkConfig:
     @staticmethod
     def deserialize(json_object: dict) -> "BenchmarkConfig":
         from sebs.faas.function import Language
-
         return BenchmarkConfig(
             json_object["timeout"],
             json_object["memory"],
@@ -591,9 +590,11 @@ class Benchmark(LoggingBase):
                 "Using cached benchmark {} at {}".format(self.benchmark, self.code_location)
             )
             if self.container_deployment:
-                return False, self.code_location, self.container_deployment, self.container_uri
-
-            return False, self.code_location, self.container_deployment, ""
+                if self._container_uri is None:
+                    pass
+                else:
+                    # Found container in cache and URI is valid.
+                    return False, self.code_location, self.container_deployment, self.container_uri
 
         msg = (
             "no cached code package."
