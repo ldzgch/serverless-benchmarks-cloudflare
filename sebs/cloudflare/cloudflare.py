@@ -563,7 +563,7 @@ if __name__ == "__main__":
         # ==============================================================================
         # PATH B: STANDARD DEPLOYMENT (Original Logic)
         # ==============================================================================
-         else:
+        else:
             # Install dependencies
             if language_name == "nodejs":
                 # Ensure Wrangler is installed
