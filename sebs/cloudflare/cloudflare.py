@@ -9,6 +9,7 @@ import docker
 import requests
 
 from sebs.cloudflare.config import CloudflareConfig
+from sebs.cloudflare.container import CloudflareContainer
 from sebs.cloudflare.function import CloudflareWorker
 from sebs.cloudflare.resources import CloudflareSystemResources
 from sebs.benchmark import Benchmark
@@ -29,6 +30,7 @@ class Cloudflare(System):
     """
 
     _config: CloudflareConfig
+    container_client: CloudflareContainer
 
     @staticmethod
     def name():
@@ -60,9 +62,13 @@ class Cloudflare(System):
             docker_client,
             CloudflareSystemResources(config, cache_client, docker_client, logger_handlers),
         )
+        self.sebs_config = sebs_config
         self.logging_handlers = logger_handlers
         self._config = config
         self._api_base_url = "https://api.cloudflare.com/client/v4"
+        self.container_client = CloudflareContainer(
+            sebs_config, config, docker_client
+        )
         # cached workers.dev subdomain for the account (e.g. 'marcin-copik')
         # This is different from the account ID and is required to build
         # public worker URLs like <name>.<subdomain>.workers.dev
@@ -372,69 +378,74 @@ bucket_name = "{bucket_name}"
         Returns:
             Tuple of (package_path, package_size, container_uri)
         """
+        self.logging.info(f"running package_code.")
+        self.logging.info(f"you would never believe that: {container_deployment}")
         if container_deployment:
-            raise NotImplementedError(
-                "Container deployment is not supported for Cloudflare Workers"
-            )
+            SERVER_FILES = {
+                "python": "server.py",
+                "nodejs": "server.js",
+            }
 
+            if language_name not in SERVER_FILES:
+                raise NotImplementedError(
+                    f"Container deployment for {language_name} is not supported."
+                )
+            
+            SERVER_FILES = {
+                "python": "server.py",
+                "nodejs": "server.js",
+            }
 
-        # Install dependencies
-        if language_name == "nodejs":
-            # Ensure Wrangler is installed
-            self._ensure_wrangler_installed()
-
+            if language_name not in SERVER_FILES:
+                raise NotImplementedError(
+                    f"Container deployment for {language_name} is not supported."
+                )
             package_file = os.path.join(directory, "package.json")
             node_modules = os.path.join(directory, "node_modules")
-
-            # Only install if package.json exists and node_modules doesn't
             if os.path.exists(package_file) and not os.path.exists(node_modules):
-                self.logging.info(f"Installing Node.js dependencies in {directory}")
-                try:
-                    # Install production dependencies
-                    result = subprocess.run(
-                        ["npm", "install"],
-                        cwd=directory,
-                        capture_output=True,
-                        text=True,
-                        check=True,
-                        timeout=120
-                    )
-                    self.logging.info("npm install completed successfully")
-                    if result.stdout:
-                        self.logging.debug(f"npm output: {result.stdout}")
+                self.logging.info(f"Installing Node.js dependencies in {directory} for container...")
+                subprocess.run(["npm", "install"], cwd=directory, check=True)
+                subprocess.run(["npm", "install", "--save-dev", "esbuild"], cwd=directory, check=True)
 
-                    # Install esbuild as a dev dependency (needed by build.js)
-                    self.logging.info("Installing esbuild for custom build script...")
-                    result = subprocess.run(
-                        ["npm", "install", "--save-dev", "esbuild"],
-                        cwd=directory,
-                        capture_output=True,
-                        text=True,
-                        check=True,
-                        timeout=60
-                    )
-                    self.logging.info("esbuild installed successfully")
+            _, container_uri = self.container_client.build_base_image(
+                directory,
+                language_name,
+                language_version,
+                architecture,
+                benchmark,
+                is_cached,
+            )
+            return (directory, 0, container_uri)
+        
+        else:
+            # Install dependencies
+            if language_name == "nodejs":
+                # Ensure Wrangler is installed
+                self._ensure_wrangler_installed()
 
+                package_file = os.path.join(directory, "package.json")
+                node_modules = os.path.join(directory, "node_modules")
 
-                except subprocess.TimeoutExpired:
-                    self.logging.error("npm install timed out")
-                    raise RuntimeError("Failed to install Node.js dependencies: timeout")
-                except subprocess.CalledProcessError as e:
-                    self.logging.error(f"npm install failed: {e.stderr}")
-                    raise RuntimeError(f"Failed to install Node.js dependencies: {e.stderr}")
-                except FileNotFoundError:
-                    raise RuntimeError(
-                        "npm not found. Please install Node.js and npm to deploy Node.js benchmarks."
-                    )
-            elif os.path.exists(node_modules):
-                self.logging.info(f"Node.js dependencies already installed in {directory}")
-
-                # Ensure esbuild is available even for cached installations
-                esbuild_path = os.path.join(node_modules, "esbuild")
-                if not os.path.exists(esbuild_path):
-                    self.logging.info("Installing esbuild for custom build script...")
+                # Only install if package.json exists and node_modules doesn't
+                if os.path.exists(package_file) and not os.path.exists(node_modules):
+                    self.logging.info(f"Installing Node.js dependencies in {directory}")
                     try:
-                        subprocess.run(
+                        # Install production dependencies
+                        result = subprocess.run(
+                            ["npm", "install"],
+                            cwd=directory,
+                            capture_output=True,
+                            text=True,
+                            check=True,
+                            timeout=120
+                        )
+                        self.logging.info("npm install completed successfully")
+                        if result.stdout:
+                            self.logging.debug(f"npm output: {result.stdout}")
+
+                        # Install esbuild as a dev dependency (needed by build.js)
+                        self.logging.info("Installing esbuild for custom build script...")
+                        result = subprocess.run(
                             ["npm", "install", "--save-dev", "esbuild"],
                             cwd=directory,
                             capture_output=True,
@@ -443,136 +454,165 @@ bucket_name = "{bucket_name}"
                             timeout=60
                         )
                         self.logging.info("esbuild installed successfully")
-                    except Exception as e:
-                        self.logging.warning(f"Failed to install esbuild: {e}")
-
-        elif language_name == "python":
-            # Ensure Wrangler is installed
-            self._ensure_pywrangler_installed()
-
-            requirements_file = os.path.join(directory, "requirements.txt")
-            if os.path.exists(f"{requirements_file}.{language_version}"):
-                src = f"{requirements_file}.{language_version}"
-                dest = requirements_file
-                shutil.move(src, dest)
-                self.logging.info(f"move {src} to {dest}")
 
 
+                    except subprocess.TimeoutExpired:
+                        self.logging.error("npm install timed out")
+                        raise RuntimeError("Failed to install Node.js dependencies: timeout")
+                    except subprocess.CalledProcessError as e:
+                        self.logging.error(f"npm install failed: {e.stderr}")
+                        raise RuntimeError(f"Failed to install Node.js dependencies: {e.stderr}")
+                    except FileNotFoundError:
+                        raise RuntimeError(
+                            "npm not found. Please install Node.js and npm to deploy Node.js benchmarks."
+                        )
+                elif os.path.exists(node_modules):
+                    self.logging.info(f"Node.js dependencies already installed in {directory}")
 
-            # move function_cloudflare.py into function.py
-            function_cloudflare_file = os.path.join(directory, "function_cloudflare.py")
-            if os.path.exists(function_cloudflare_file):
-                src = function_cloudflare_file
-                dest = os.path.join(directory, "function.py")
-                shutil.move(src, dest)
-                self.logging.info(f"move {src} to {dest}")
+                    # Ensure esbuild is available even for cached installations
+                    esbuild_path = os.path.join(node_modules, "esbuild")
+                    if not os.path.exists(esbuild_path):
+                        self.logging.info("Installing esbuild for custom build script...")
+                        try:
+                            subprocess.run(
+                                ["npm", "install", "--save-dev", "esbuild"],
+                                cwd=directory,
+                                capture_output=True,
+                                text=True,
+                                check=True,
+                                timeout=60
+                            )
+                            self.logging.info("esbuild installed successfully")
+                        except Exception as e:
+                            self.logging.warning(f"Failed to install esbuild: {e}")
 
-            if os.path.exists(requirements_file):
-                with open(requirements_file, 'r') as reqf:
-                    reqtext = reqf.read()
-                supported_pkg = \
-['affine', 'aiohappyeyeballs', 'aiohttp', 'aiosignal', 'altair', 'annotated-types',\
-'anyio', 'apsw', 'argon2-cffi', 'argon2-cffi-bindings', 'asciitree', 'astropy', 'astropy_iers_data',\
-'asttokens', 'async-timeout', 'atomicwrites', 'attrs', 'audioop-lts', 'autograd', 'awkward-cpp', 'b2d',\
-'bcrypt', 'beautifulsoup4', 'bilby.cython', 'biopython', 'bitarray', 'bitstring', 'bleach', 'blosc2', 'bokeh',\
-'boost-histogram', 'brotli', 'cachetools', 'casadi', 'cbor-diag', 'certifi', 'cffi', 'cffi_example', 'cftime',\
-'charset-normalizer', 'clarabel', 'click', 'cligj', 'clingo', 'cloudpickle', 'cmyt', 'cobs', 'colorspacious',\
-'contourpy', 'coolprop', 'coverage', 'cramjam', 'crc32c', 'cryptography', 'css-inline', 'cssselect', 'cvxpy-base', 'cycler',\
-'cysignals', 'cytoolz', 'decorator', 'demes', 'deprecation', 'diskcache', 'distlib', 'distro', 'docutils', 'donfig',\
-'ewah_bool_utils', 'exceptiongroup', 'executing', 'fastapi', 'fastcan', 'fastparquet', 'fiona', 'fonttools', 'freesasa',\
-'frozenlist', 'fsspec', 'future', 'galpy', 'gmpy2', 'gsw', 'h11', 'h3', 'h5py', 'highspy', 'html5lib', 'httpcore',\
-'httpx', 'idna', 'igraph', 'imageio', 'imgui-bundle', 'iminuit', 'iniconfig', 'inspice', 'ipython', 'jedi', 'Jinja2',\
-'jiter', 'joblib', 'jsonpatch', 'jsonpointer', 'jsonschema', 'jsonschema_specifications', 'kiwisolver',\
-'lakers-python', 'lazy_loader', 'lazy-object-proxy', 'libcst', 'lightgbm', 'logbook', 'lxml', 'lz4', 'MarkupSafe',\
-'matplotlib', 'matplotlib-inline', 'memory-allocator', 'micropip', 'mmh3', 'more-itertools', 'mpmath',\
-'msgpack', 'msgspec', 'msprime', 'multidict', 'munch', 'mypy', 'narwhals', 'ndindex', 'netcdf4', 'networkx',\
-'newick', 'nh3', 'nlopt', 'nltk', 'numcodecs', 'numpy', 'openai', 'opencv-python', 'optlang', 'orjson',\
-'packaging', 'pandas', 'parso', 'patsy', 'pcodec', 'peewee', 'pi-heif', 'Pillow', 'pillow-heif', 'pkgconfig',\
-'platformdirs', 'pluggy', 'ply', 'pplpy', 'primecountpy', 'prompt_toolkit', 'propcache', 'protobuf', 'pure-eval',\
-'py', 'pyclipper', 'pycparser', 'pycryptodome', 'pydantic', 'pydantic_core', 'pyerfa', 'pygame-ce', 'Pygments',\
-'pyheif', 'pyiceberg', 'pyinstrument', 'pylimer-tools', 'PyMuPDF', 'pynacl', 'pyodide-http', 'pyodide-unix-timezones',\
-'pyparsing', 'pyrsistent', 'pysam', 'pyshp', 'pytaglib', 'pytest', 'pytest-asyncio', 'pytest-benchmark', 'pytest_httpx',\
-'python-calamine', 'python-dateutil', 'python-flint', 'python-magic', 'python-sat', 'python-solvespace', 'pytz', 'pywavelets',\
-'pyxel', 'pyxirr', 'pyyaml', 'rasterio', 'rateslib', 'rebound', 'reboundx', 'referencing', 'regex', 'requests',\
-'retrying', 'rich', 'river', 'RobotRaconteur', 'rpds-py', 'ruamel.yaml', 'rustworkx', 'scikit-image', 'scikit-learn',\
-'scipy', 'screed', 'setuptools', 'shapely', 'simplejson', 'sisl', 'six', 'smart-open', 'sniffio', 'sortedcontainers',\
-'soundfile', 'soupsieve', 'sourmash', 'soxr', 'sparseqr', 'sqlalchemy', 'stack-data', 'starlette', 'statsmodels', 'strictyaml',\
-'svgwrite', 'swiglpk', 'sympy', 'tblib', 'termcolor', 'texttable', 'texture2ddecoder', 'threadpoolctl', 'tiktoken', 'tomli',\
-'tomli-w', 'toolz', 'tqdm', 'traitlets', 'traits', 'tree-sitter', 'tree-sitter-go', 'tree-sitter-java', 'tree-sitter-python',\
-'tskit', 'typing-extensions', 'tzdata', 'ujson', 'uncertainties', 'unyt', 'urllib3', 'vega-datasets', 'vrplib', 'wcwidth',\
-'webencodings', 'wordcloud', 'wrapt', 'xarray', 'xgboost', 'xlrd', 'xxhash', 'xyzservices', 'yarl', 'yt', 'zengl', 'zfpy', 'zstandard']
-                needed_pkg = []
-                for pkg in supported_pkg:
-                    if pkg.lower() in reqtext.lower():
-                        needed_pkg.append(pkg)
+            elif language_name == "python":
+                # Ensure Wrangler is installed
+                self._ensure_pywrangler_installed()
 
-                project_file = os.path.join(directory, "pyproject.toml")
-                depstr = str(needed_pkg).replace("\'", "\"")
-                with open(project_file, 'w') as pf:
-                    pf.write(f"""
-[project]
-name = "{benchmark.replace(".", "-")}-python-{language_version.replace(".", "")}"
-version = "0.1.0"
-description = "dummy description"
-requires-python = ">={language_version}"
-dependencies = {depstr}
-
-[dependency-groups]
-dev = [
-  "workers-py",
-  "workers-runtime-sdk"
-]
-                    """)
-            # move into function dir
-            funcdir = os.path.join(directory, "function")
-            if not os.path.exists(funcdir):
-                os.makedirs(funcdir)
-
-            dont_move = ["handler.py", "function", "python_modules", "pyproject.toml"]
-            for thing in os.listdir(directory):
-                if thing not in dont_move:
-                    src = os.path.join(directory, thing)
-                    dest = os.path.join(directory, "function", thing)
+                requirements_file = os.path.join(directory, "requirements.txt")
+                if os.path.exists(f"{requirements_file}.{language_version}"):
+                    src = f"{requirements_file}.{language_version}"
+                    dest = requirements_file
                     shutil.move(src, dest)
                     self.logging.info(f"move {src} to {dest}")
 
-        # Create package structure
-        CONFIG_FILES = {
-            "nodejs": ["handler.js", "package.json", "node_modules"],
-            "python": ["handler.py", "requirements.txt", "python_modules"],
-        }
 
-        if language_name not in CONFIG_FILES:
-            raise NotImplementedError(
-                f"Language {language_name} is not yet supported for Cloudflare Workers"
-            )
 
-        # Verify the handler exists
-        handler_file = "handler.js" if language_name == "nodejs" else "handler.py"
-        package_path = os.path.join(directory, handler_file)
+                # move function_cloudflare.py into function.py
+                function_cloudflare_file = os.path.join(directory, "function_cloudflare.py")
+                if os.path.exists(function_cloudflare_file):
+                    src = function_cloudflare_file
+                    dest = os.path.join(directory, "function.py")
+                    shutil.move(src, dest)
+                    self.logging.info(f"move {src} to {dest}")
 
-        if not os.path.exists(package_path):
-            if not os.path.exists(directory):
-                raise RuntimeError(
-                    f"Package directory {directory} does not exist. "
-                    "The benchmark build process may have failed to create the deployment package."
+                if os.path.exists(requirements_file):
+                    with open(requirements_file, 'r') as reqf:
+                        reqtext = reqf.read()
+                    supported_pkg = \
+    ['affine', 'aiohappyeyeballs', 'aiohttp', 'aiosignal', 'altair', 'annotated-types',\
+    'anyio', 'apsw', 'argon2-cffi', 'argon2-cffi-bindings', 'asciitree', 'astropy', 'astropy_iers_data',\
+    'asttokens', 'async-timeout', 'atomicwrites', 'attrs', 'audioop-lts', 'autograd', 'awkward-cpp', 'b2d',\
+    'bcrypt', 'beautifulsoup4', 'bilby.cython', 'biopython', 'bitarray', 'bitstring', 'bleach', 'blosc2', 'bokeh',\
+    'boost-histogram', 'brotli', 'cachetools', 'casadi', 'cbor-diag', 'certifi', 'cffi', 'cffi_example', 'cftime',\
+    'charset-normalizer', 'clarabel', 'click', 'cligj', 'clingo', 'cloudpickle', 'cmyt', 'cobs', 'colorspacious',\
+    'contourpy', 'coolprop', 'coverage', 'cramjam', 'crc32c', 'cryptography', 'css-inline', 'cssselect', 'cvxpy-base', 'cycler',\
+    'cysignals', 'cytoolz', 'decorator', 'demes', 'deprecation', 'diskcache', 'distlib', 'distro', 'docutils', 'donfig',\
+    'ewah_bool_utils', 'exceptiongroup', 'executing', 'fastapi', 'fastcan', 'fastparquet', 'fiona', 'fonttools', 'freesasa',\
+    'frozenlist', 'fsspec', 'future', 'galpy', 'gmpy2', 'gsw', 'h11', 'h3', 'h5py', 'highspy', 'html5lib', 'httpcore',\
+    'httpx', 'idna', 'igraph', 'imageio', 'imgui-bundle', 'iminuit', 'iniconfig', 'inspice', 'ipython', 'jedi', 'Jinja2',\
+    'jiter', 'joblib', 'jsonpatch', 'jsonpointer', 'jsonschema', 'jsonschema_specifications', 'kiwisolver',\
+    'lakers-python', 'lazy_loader', 'lazy-object-proxy', 'libcst', 'lightgbm', 'logbook', 'lxml', 'lz4', 'MarkupSafe',\
+    'matplotlib', 'matplotlib-inline', 'memory-allocator', 'micropip', 'mmh3', 'more-itertools', 'mpmath',\
+    'msgpack', 'msgspec', 'msprime', 'multidict', 'munch', 'mypy', 'narwhals', 'ndindex', 'netcdf4', 'networkx',\
+    'newick', 'nh3', 'nlopt', 'nltk', 'numcodecs', 'numpy', 'openai', 'opencv-python', 'optlang', 'orjson',\
+    'packaging', 'pandas', 'parso', 'patsy', 'pcodec', 'peewee', 'pi-heif', 'Pillow', 'pillow-heif', 'pkgconfig',\
+    'platformdirs', 'pluggy', 'ply', 'pplpy', 'primecountpy', 'prompt_toolkit', 'propcache', 'protobuf', 'pure-eval',\
+    'py', 'pyclipper', 'pycparser', 'pycryptodome', 'pydantic', 'pydantic_core', 'pyerfa', 'pygame-ce', 'Pygments',\
+    'pyheif', 'pyiceberg', 'pyinstrument', 'pylimer-tools', 'PyMuPDF', 'pynacl', 'pyodide-http', 'pyodide-unix-timezones',\
+    'pyparsing', 'pyrsistent', 'pysam', 'pyshp', 'pytaglib', 'pytest', 'pytest-asyncio', 'pytest-benchmark', 'pytest_httpx',\
+    'python-calamine', 'python-dateutil', 'python-flint', 'python-magic', 'python-sat', 'python-solvespace', 'pytz', 'pywavelets',\
+    'pyxel', 'pyxirr', 'pyyaml', 'rasterio', 'rateslib', 'rebound', 'reboundx', 'referencing', 'regex', 'requests',\
+    'retrying', 'rich', 'river', 'RobotRaconteur', 'rpds-py', 'ruamel.yaml', 'rustworkx', 'scikit-image', 'scikit-learn',\
+    'scipy', 'screed', 'setuptools', 'shapely', 'simplejson', 'sisl', 'six', 'smart-open', 'sniffio', 'sortedcontainers',\
+    'soundfile', 'soupsieve', 'sourmash', 'soxr', 'sparseqr', 'sqlalchemy', 'stack-data', 'starlette', 'statsmodels', 'strictyaml',\
+    'svgwrite', 'swiglpk', 'sympy', 'tblib', 'termcolor', 'texttable', 'texture2ddecoder', 'threadpoolctl', 'tiktoken', 'tomli',\
+    'tomli-w', 'toolz', 'tqdm', 'traitlets', 'traits', 'tree-sitter', 'tree-sitter-go', 'tree-sitter-java', 'tree-sitter-python',\
+    'tskit', 'typing-extensions', 'tzdata', 'ujson', 'uncertainties', 'unyt', 'urllib3', 'vega-datasets', 'vrplib', 'wcwidth',\
+    'webencodings', 'wordcloud', 'wrapt', 'xarray', 'xgboost', 'xlrd', 'xxhash', 'xyzservices', 'yarl', 'yt', 'zengl', 'zfpy', 'zstandard']
+                    needed_pkg = []
+                    for pkg in supported_pkg:
+                        if pkg.lower() in reqtext.lower():
+                            needed_pkg.append(pkg)
+
+                    project_file = os.path.join(directory, "pyproject.toml")
+                    depstr = str(needed_pkg).replace("\'", "\"")
+                    with open(project_file, 'w') as pf:
+                        pf.write(f"""
+    [project]
+    name = "{benchmark.replace(".", "-")}-python-{language_version.replace(".", "")}"
+    version = "0.1.0"
+    description = "dummy description"
+    requires-python = ">={language_version}"
+    dependencies = {depstr}
+
+    [dependency-groups]
+    dev = [
+    "workers-py",
+    "workers-runtime-sdk"
+    ]
+                        """)
+                # move into function dir
+                funcdir = os.path.join(directory, "function")
+                if not os.path.exists(funcdir):
+                    os.makedirs(funcdir)
+
+                dont_move = ["handler.py", "function", "python_modules", "pyproject.toml"]
+                for thing in os.listdir(directory):
+                    if thing not in dont_move:
+                        src = os.path.join(directory, thing)
+                        dest = os.path.join(directory, "function", thing)
+                        shutil.move(src, dest)
+                        self.logging.info(f"move {src} to {dest}")
+
+            # Create package structure
+            CONFIG_FILES = {
+                "nodejs": ["handler.js", "package.json", "node_modules"],
+                "python": ["handler.py", "requirements.txt", "python_modules"],
+            }
+
+            if language_name not in CONFIG_FILES:
+                raise NotImplementedError(
+                    f"Language {language_name} is not yet supported for Cloudflare Workers"
                 )
-            raise RuntimeError(
-                f"Handler file {handler_file} not found in {directory}. "
-                f"Available files: {', '.join(os.listdir(directory)) if os.path.exists(directory) else 'none'}"
-            )
 
-        # Calculate total size of the package directory
-        total_size = 0
-        for dirpath, dirnames, filenames in os.walk(directory):
-            for filename in filenames:
-                filepath = os.path.join(dirpath, filename)
-                total_size += os.path.getsize(filepath)
+            # Verify the handler exists
+            handler_file = "handler.js" if language_name == "nodejs" else "handler.py"
+            package_path = os.path.join(directory, handler_file)
 
-        mbytes = total_size / 1024.0 / 1024.0
-        self.logging.info(f"Worker package size: {mbytes:.2f} MB (Python: missing vendored modules)")
+            if not os.path.exists(package_path):
+                if not os.path.exists(directory):
+                    raise RuntimeError(
+                        f"Package directory {directory} does not exist. "
+                        "The benchmark build process may have failed to create the deployment package."
+                    )
+                raise RuntimeError(
+                    f"Handler file {handler_file} not found in {directory}. "
+                    f"Available files: {', '.join(os.listdir(directory)) if os.path.exists(directory) else 'none'}"
+                )
 
-        return (directory, total_size, "")
+            # Calculate total size of the package directory
+            total_size = 0
+            for dirpath, dirnames, filenames in os.walk(directory):
+                for filename in filenames:
+                    filepath = os.path.join(dirpath, filename)
+                    total_size += os.path.getsize(filepath)
+
+            mbytes = total_size / 1024.0 / 1024.0
+            self.logging.info(f"Worker package size: {mbytes:.2f} MB (Python: missing vendored modules)")
+
+            return (directory, total_size, "")
 
     def create_function(
         self,
@@ -589,16 +629,21 @@ dev = [
         Args:
             code_package: Benchmark containing the function code
             func_name: Name of the worker
-            container_deployment: Whether to deploy as container (not supported)
+            container_deployment: Whether to deploy as container
             container_uri: URI of container image (not used)
 
         Returns:
             CloudflareWorker instance
         """
-        if container_deployment:
-            raise NotImplementedError(
-                "Container deployment is not supported for Cloudflare Workers"
-            )
+        # Check the *passed* argument:
+        self.logging.info(f"Container Deployment PASSED: {container_deployment}") 
+        
+        # Check the *source* argument:
+        #self.logging.info(f"Container Deployment SOURCE: {code_package.experiment_config.container_deployment}")
+        if True:
+            container_deployment = True
+            self.logging.info("Container deployment flag forcefully set to True.")
+        
 
         package = code_package.code_location
         benchmark = code_package.benchmark
@@ -611,54 +656,79 @@ dev = [
 
         if not account_id:
             raise RuntimeError("Cloudflare account ID is required to create workers")
-
-        # Check if worker already exists
-        existing_worker = self._get_worker(func_name, account_id)
-
-        if existing_worker:
-            self.logging.info(f"Worker {func_name} already exists, updating it")
+        
+        if container_deployment:
+            # ---- CONTAINER DEPLOYMENT ----
+            # We must update/deploy every time for containers,
+            # as we can't easily check the deployed image URI.
+            self.logging.info(f"Creating/Updating container worker {func_name}")
+            build_dir = code_package.code_location
+            if not container_uri:
+                raise RuntimeError("container_uri is required for container deployment")
+ 
+            self._deploy_container_worker(func_name, build_dir, container_uri)
             worker = CloudflareWorker(
-                func_name,
-                code_package.benchmark,
-                func_name,  # script_id is the same as name
-                code_package.hash,
-                language_runtime,
-                function_cfg,
-                account_id,
-            )
+                 func_name,
+                 code_package.benchmark,
+                 func_name,  # script_id is the same as name
+                 func_name,
+                 code_package.hash,
+                 language_runtime,
+                 function_cfg,
+                 account_id,
+             )
             self.update_function(worker, code_package, container_deployment, container_uri)
             worker.updated_code = True
+            worker.updated_code = True # We always update containers
         else:
-            self.logging.info(f"Creating new worker {func_name}")
 
-            # Create the worker with all package files
-            self._create_or_update_worker(func_name, package, account_id, language, benchmark, code_package)
+            # Check if worker already exists
+            existing_worker = self._get_worker(func_name, account_id)
 
-            worker = CloudflareWorker(
-                func_name,
-                code_package.benchmark,
-                func_name,
-                code_package.hash,
-                language_runtime,
-                function_cfg,
-                account_id,
-            )
+            if existing_worker:
+                self.logging.info(f"Worker {func_name} already exists, updating it")
+                worker = CloudflareWorker(
+                    func_name,
+                    code_package.benchmark,
+                    func_name,  # script_id is the same as name
+                    code_package.hash,
+                    language_runtime,
+                    function_cfg,
+                    account_id,
+                )
+                self.update_function(worker, code_package, container_deployment, container_uri)
+                worker.updated_code = True
+            else:
+                self.logging.info(f"Creating new worker {func_name}")
 
-        # Add LibraryTrigger and HTTPTrigger
-        from sebs.cloudflare.triggers import LibraryTrigger, HTTPTrigger
+                # Create the worker with all package files
+                self._create_or_update_worker(func_name, package, account_id, language, benchmark, code_package)
 
-        library_trigger = LibraryTrigger(func_name, self)
-        library_trigger.logging_handlers = self.logging_handlers
-        worker.add_trigger(library_trigger)
+                worker = CloudflareWorker(
+                    func_name,
+                    code_package.benchmark,
+                    func_name,
+                    code_package.hash,
+                    language_runtime,
+                    function_cfg,
+                    account_id,
+                )
 
-        # Build worker URL using the account's workers.dev subdomain when possible.
-        # Falls back to account_id-based host or plain workers.dev with warnings.
-        worker_url = self._build_workers_dev_url(func_name, account_id)
-        http_trigger = HTTPTrigger(func_name, worker_url)
-        http_trigger.logging_handlers = self.logging_handlers
-        worker.add_trigger(http_trigger)
+            # Add LibraryTrigger and HTTPTrigger
+            from sebs.cloudflare.triggers import LibraryTrigger, HTTPTrigger
 
-        return worker
+            library_trigger = LibraryTrigger(func_name, self)
+            library_trigger.logging_handlers = self.logging_handlers
+            worker.add_trigger(library_trigger)
+
+            # Build worker URL using the account's workers.dev subdomain when possible.
+            # Falls back to account_id-based host or plain workers.dev with warnings.
+            worker_url = self._build_workers_dev_url(func_name, account_id)
+            http_trigger = HTTPTrigger(func_name, worker_url)
+            http_trigger.logging_handlers = self.logging_handlers
+            worker.add_trigger(http_trigger)
+
+            return worker
 
     def _get_worker(self, worker_name: str, account_id: str) -> Optional[dict]:
         """Get information about an existing worker."""
@@ -853,22 +923,26 @@ dev = [
             container_uri: URI of container image (not used)
         """
         if container_deployment:
-            raise NotImplementedError(
-                "Container deployment is not supported for Cloudflare Workers"
-            )
+            self.logging.info(f"Updating container worker {worker.name}")
+            build_dir = code_package.code_location
+            if not container_uri:
+                raise RuntimeError("container_uri is required for container deployment")
 
-        worker = cast(CloudflareWorker, function)
-        package = code_package.code_location
-        language = code_package.language_name
-        benchmark = code_package.benchmark
+            self._deploy_container_worker(worker.name, build_dir, container_uri)
+            self.logging.info(f"Updated container worker {worker.name}")
+        else:
+            worker = cast(CloudflareWorker, function)
+            package = code_package.code_location
+            language = code_package.language_name
+            benchmark = code_package.benchmark
 
-        # Update the worker with all package files
-        account_id = worker.account_id or self.config.credentials.account_id
-        if not account_id:
-            raise RuntimeError("Account ID is required to update worker")
+            # Update the worker with all package files
+            account_id = worker.account_id or self.config.credentials.account_id
+            if not account_id:
+                raise RuntimeError("Account ID is required to update worker")
 
-        self._create_or_update_worker(worker.name, package, account_id, language, benchmark, code_package)
-        self.logging.info(f"Updated worker {worker.name}")
+            self._create_or_update_worker(worker.name, package, account_id, language, benchmark, code_package)
+            self.logging.info(f"Updated worker {worker.name}")
 
         # Update configuration if needed
         self.update_function_configuration(worker, code_package)
@@ -899,6 +973,86 @@ dev = [
             f"Configuration update requested for worker {worker.name}. "
             "Note: Cloudflare Workers have limited runtime configuration options."
         )
+    def _deploy_container_worker(
+        self, worker_name: str, build_dir: str, container_uri: str
+    ):
+        """
+        Deploys a container-based worker using `wrangler`.
+        
+        This function generates a loader script and a wrangler.toml,
+        then executes `wrangler deploy`.
+        Args:
+            worker_name: The name for the worker.
+            build_dir: The build context directory (where Dockerfile is).
+            container_uri: The full URI of the pushed container image.
+        """
+        self.logging.info(f"Deploying container {container_uri} to worker {worker_name}")
+
+        # 1. Generate wrangler.toml
+        #    Note: We use a fixed compatibility date. This could be configurable.
+        toml_content = f"""
+name = "{worker_name}"
+main = "loader.js"
+compatibility_date = "2024-05-01"
+[[containers]]
+class_name = "Worker"  # or the class you want
+image = "{container_uri}"
+"""
+        toml_path = os.path.join(build_dir, "wrangler.toml")
+        with open(toml_path, "w") as f:
+            f.write(toml_content)
+
+        # 2. Generate loader.js entrypoint script
+        #    This script forwards requests to the container.
+        loader_content = """
+export default {
+  async fetch(request, env, ctx) {
+    // getByName("instance") creates/gets a proxy to the container instance
+    const container = env.MY_CONTAINER.getByName("instance");
+    // Forward the original request to the container
+    return container.fetch(request);
+  },
+};
+"""
+        loader_path = os.path.join(build_dir, "loader.js")
+        with open(loader_path, "w") as f:
+            f.write(loader_content)
+
+        # 3. Get API token for wrangler
+        api_token = self.config.credentials.api_token
+        if not api_token:
+            raise RuntimeError("Cloudflare API token is required to deploy with wrangler.")
+
+        push_env = os.environ.copy()
+        push_env["CLOUDFLARE_API_TOKEN"] = api_token
+
+        cmd = ["wrangler", "deploy"]
+
+        try:
+            process = subprocess.run(
+                cmd,
+                env=push_env,
+                cwd=build_dir, # Run from the build directory
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+            )
+            self.logging.info(f"Wrangler deploy stdout: {process.stdout}")
+            self.logging.info(f"Successfully deployed container worker {worker_name}")
+
+        except subprocess.CalledProcessError as e:
+            self.logging.error(f"Failed to deploy container worker {worker_name} with wrangler.")
+            self.logging.error(f"Wrangler return code: {e.returncode}")
+            self.logging.error(f"Wrangler stdout: {e.stdout}")
+            self.logging.error(f"Wrangler stderr: {e.stderr}")
+            raise RuntimeError(f"Wrangler deploy failed: {e.stderr}")
+        except FileNotFoundError:
+            self.logging.error("`wrangler` command not found.")
+            raise RuntimeError(
+                "`wrangler` CLI is not installed or not in PATH. "
+                "It is required for Cloudflare container operations."
+            )
 
     def default_function_name(self, code_package: Benchmark, resources=None) -> str:
         """

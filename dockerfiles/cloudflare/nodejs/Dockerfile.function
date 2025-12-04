@@ -1,0 +1,20 @@
+FROM node:18-slim
+
+WORKDIR /app
+
+# Copy benchmark dependencies first for layer caching
+COPY package.json package-lock.json* ./
+
+# Install only production dependencies
+RUN npm ci --production
+
+# Copy all benchmark code (handler.js, etc.)
+# AND the server.js wrapper (which package_code will have copied)
+COPY . .
+
+# Set the port the container will listen on
+ENV PORT 8080
+EXPOSE 8080
+
+# Run the web server wrapper, NOT the handler
+CMD ["node", "server.js"]
