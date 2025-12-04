@@ -1,0 +1,19 @@
+FROM python:3.10-slim
+
+WORKDIR /app
+
+# Copy requirements first to leverage Docker layer caching
+COPY requirements.txt ./
+
+# Install dependencies
+RUN pip install --no-cache-dir --upgrade pip && \
+    if [ -s requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; fi
+
+# Copy all benchmark code (benchmark.py, etc.)
+COPY . .
+
+# Set the port the container will listen on
+ENV PORT 8080
+EXPOSE 8080
+
+CMD ["python", "server.py"]
