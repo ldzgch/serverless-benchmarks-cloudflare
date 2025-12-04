@@ -195,7 +195,15 @@ class CloudflareContainer(DockerContainer):
             repository_uri: The full repository URI (e.g., "registry.cloudflare.com/account-id/repo-name").
             image_tag: The image tag (e.g., "18-x64").
         """
-        full_image_name = f"{repository_uri}:{image_tag}"
+        if ':' in repository_uri:
+            base_image_name = repository_uri.split(':')[0]
+            final_image_tag = image_tag
+        else:
+            base_image_name = repository_uri
+            final_image_tag = image_tag
+
+        full_image_name = f"{base_image_name}:{final_image_tag}"
+        
         self.logging.info(f"Pushing image {full_image_name} to Cloudflare using wrangler...")
 
         api_token = self.config.credentials.api_token
