@@ -268,6 +268,7 @@ class Cache(LoggingBase):
 
                 key = f"{language_version}-{architecture}"
                 if code_package.container_deployment:
+                    print("HEREEE")
                     image = self.docker_client.images.get(code_package.container_uri)
                     language_config["image-uri"] = code_package.container_uri
                     language_config["image-id"] = image.id

@@ -96,6 +96,14 @@ To install the benchmarks with a support for all platforms, use:
 ```
 ./install.py --aws --azure --gcp --openwhisk --local
 ```
+. python-venv/bin/activate
+export CLOUDFLARE_API_TOKEN=GZhexQ6SHG5BQKEw4x5ZDtYKoPME79yk8aYM7vw7;
+export CLOUDFLARE_ACCOUNT_ID=eaf7050d8d599d4ae7d925a6f0fd5ea4;
+export CLOUDFLARE_R2_ACCESS_KEY_ID=bb5935044b2ec1836f193cd9d53cdbbd;
+export CLOUDFLARE_R2_TOKEN_VALUE=viFWIN3RXyyXd1fGr-zliQzYkPOPOdLmqdIHczRq;
+export export CLOUDFLARE_R2_SECRET_ACCESS_KEY=ea20d64fbf9f216823e79e8359cccd310b50c881719b4d6e9a718d1766e3f8c2;
+python 
+./sebs.py benchmark invoke --config config/cloudflare-test.json 110.dynamic-html test
 
 It will create a virtual environment in `python-venv`, and install necessary Python
 dependencies and third-party dependencies. To use SeBS, you must first active the new Python
