@@ -362,57 +362,194 @@ bucket_name = "{bucket_name}"
         container_deployment: bool,
     ) -> Tuple[str, int, str]:
         """
-        Package code for Cloudflare Workers deployment using Wrangler.
-
-        Uses Wrangler CLI to bundle dependencies and prepare for deployment.
-
-        Args:
-            directory: Path to the code directory
-            language_name: Programming language name
-            language_version: Programming language version
-            architecture: Target architecture (not used for Workers)
-            benchmark: Benchmark name
-            is_cached: Whether the code is cached
-            container_deployment: Whether to deploy as container (not supported)
-
-        Returns:
-            Tuple of (package_path, package_size, container_uri)
+        Package code for Cloudflare Workers deployment.
         """
-        self.logging.info(f"running package_code.")
         self._ensure_wrangler_installed()
+        
+        # Force container deployment if supported by config
         if self.system_config.supported_container_deployment(self.name()):
-        # If the platform supports containers, and we are expecting one, force it.
             container_deployment = True 
-            self.logging.info(f"Forcing container_deployment=True in package_code.")
+            self.logging.info(f"Forcing container_deployment=True.")
 
-        self.logging.info(f"you would never believe that: {container_deployment}")
+        # ==============================================================================
+        # PATH A: CONTAINER DEPLOYMENT
+        # ==============================================================================
         if container_deployment:
-            SERVER_FILES = {
-                "python": "server.py",
-                "nodejs": "server.js",
-            }
-
-            if language_name not in SERVER_FILES:
-                raise NotImplementedError(
-                    f"Container deployment for {language_name} is not supported."
-                )
             
-            SERVER_FILES = {
-                "python": "server.py",
-                "nodejs": "server.js",
-            }
+            # --- NODE.JS ADAPTER INJECTION ---
+            if language_name == "nodejs":
+                handler_path = os.path.join(directory, "handler.js")
+                benchmark_path = os.path.join(directory, "benchmark.js")
+                entrypoint_path = os.path.join(directory, "index.js")
+                pkg_json_path = os.path.join(directory, "package.json")
+                
+                # 1. Rename original handler to benchmark.js
+                # This moves the SeBS-generated code out of the way
+                if os.path.exists(handler_path) and not os.path.exists(benchmark_path):
+                    self.logging.info("Renaming handler.js to benchmark.js...")
+                    shutil.move(handler_path, benchmark_path)
+                elif os.path.exists(benchmark_path):
+                    self.logging.info("benchmark.js already exists, using existing shim...")
 
-            if language_name not in SERVER_FILES:
-                raise NotImplementedError(
-                    f"Container deployment for {language_name} is not supported."
-                )
-            package_file = os.path.join(directory, "package.json")
-            node_modules = os.path.join(directory, "node_modules")
-            if os.path.exists(package_file) and not os.path.exists(node_modules):
-                self.logging.info(f"Installing Node.js dependencies in {directory} for container...")
+                # 2. Create the Cloudflare Adapter (index.js)
+                # This shim translates the 'fetch' request to the benchmark handler call
+                if not os.path.exists(entrypoint_path):
+                    self.logging.info("Creating Cloudflare->Node.js Adapter (index.js)...")
+                    adapter_code = """
+import * as benchmark from './benchmark.js';
+
+export default {
+    async fetch(request, env, ctx) {
+        let payload = {};
+        try {
+            const contentType = request.headers.get("content-type");
+            if (request.body && contentType && contentType.includes("application/json")) {
+                payload = await request.json();
+            }
+        } catch (e) { console.warn("Adapter: Payload parsing error", e); }
+
+        // Locate the handler function (supports CommonJS exports and ESM export)
+        let fn = benchmark.handler;
+        if (!fn && benchmark.default) {
+            fn = benchmark.default.handler || benchmark.default;
+        }
+
+        if (typeof fn !== 'function') {
+            return new Response("Adapter Error: 'handler' function not found in benchmark.js", {status: 500});
+        }
+
+        try {
+            // Execute the benchmark
+            const result = await fn(payload);
+            return new Response(JSON.stringify(result), { headers: { 'content-type': 'application/json' } });
+        } catch (e) {
+            console.error("Benchmark Execution Failed", e);
+            return new Response("Benchmark Error: " + (e.message || e), {status: 500});
+        }
+    }
+};
+"""
+                    with open(entrypoint_path, "w") as f:
+                        f.write(adapter_code)
+
+                # 3. Patch package.json for ES Modules
+                # We MUST tell Node.js to treat .js files as Modules for 'export default' to work
+                if os.path.exists(pkg_json_path):
+                    try:
+                        with open(pkg_json_path, 'r') as f:
+                            pkg_data = json.load(f)
+                        
+                        pkg_data["main"] = "index.js"
+                        pkg_data["type"] = "module"
+                        
+                        with open(pkg_json_path, 'w') as f:
+                            json.dump(pkg_data, f, indent=2)
+                        self.logging.info("Patched package.json for ES Module support.")
+                    except Exception as e:
+                        self.logging.warning(f"Could not patch package.json: {e}")
+                else:
+                    # Create minimal package.json if missing
+                    with open(pkg_json_path, 'w') as f:
+                        json.dump({"name": "worker-container", "main": "index.js", "type": "module"}, f, indent=2)
+
+                # 4. Install Dependencies
+                self.logging.info(f"Installing Node.js dependencies in {directory}...")
                 subprocess.run(["npm", "install"], cwd=directory, check=True)
+                # Ensure esbuild is installed for any internal bundling needs
                 subprocess.run(["npm", "install", "--save-dev", "esbuild"], cwd=directory, check=True)
 
+            # --- PYTHON ADAPTER INJECTION ---
+            elif language_name == "python":
+                self.logging.info("Preparing Python Container environment...")
+                
+                handler_path = os.path.join(directory, "handler.py")
+                benchmark_path = os.path.join(directory, "benchmark.py")
+                server_path = os.path.join(directory, "server.py")
+
+                # 1. Rename original handler to benchmark.py
+                if os.path.exists(handler_path) and not os.path.exists(benchmark_path):
+                    self.logging.info("Renaming handler.py to benchmark.py...")
+                    shutil.move(handler_path, benchmark_path)
+                
+                # 2. Generate server.py (Standard HTTP Server)
+                # This replaces the Pyodide 'js' adapter with a real web server.
+                if not os.path.exists(server_path):
+                    self.logging.info("Generating server.py wrapper...")
+                    server_code = """
+import http.server
+import socketserver
+import json
+import sys
+import benchmark # The renamed benchmark handler
+
+PORT = 8080
+
+class RequestHandler(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        try:
+            # 1. Parse Input
+            content_length = int(self.headers.get('Content-Length', 0))
+            post_data = self.rfile.read(content_length)
+            event = json.loads(post_data.decode('utf-8'))
+            context = {}
+
+            # 2. Execute Benchmark
+            # Handle both synchronous and async handlers
+            # Note: For simple http.server, we run sync. 
+            # If benchmark is async, we might need asyncio.run()
+            import inspect
+            import asyncio
+            
+            if inspect.iscoroutinefunction(benchmark.handler):
+                result = asyncio.run(benchmark.handler(event, context))
+            else:
+                result = benchmark.handler(event, context)
+
+            # 3. Send Response
+            response = json.dumps(result).encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(response)
+
+        except Exception as e:
+            # Log error and return 500
+            print(f"Error executing benchmark: {e}", file=sys.stderr)
+            import traceback
+            traceback.print_exc()
+            self.send_response(500)
+            self.end_headers()
+            self.wfile.write(str(e).encode('utf-8'))
+
+    # Also handle GET for health checks if needed
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+if __name__ == "__main__":
+    with socketserver.TCPServer(("", PORT), RequestHandler) as httpd:
+        print(f"Serving at port {PORT}")
+        httpd.serve_forever()
+"""
+                    with open(server_path, "w") as f:
+                        f.write(server_code)
+
+                # 3. Handle Python Requirements Versioning
+                requirements_file = os.path.join(directory, "requirements.txt")
+                if os.path.exists(f"{requirements_file}.{language_version}"):
+                    shutil.move(f"{requirements_file}.{language_version}", requirements_file)
+
+            # --- BUILD CONTAINER ---
+            SERVER_FILES = {
+                "python": "server.py", # or handler.py depending on base image
+                "nodejs": "server.js",
+            }
+            
+            # Note: We skip the check `if language_name not in SERVER_FILES` strictly here
+            # because we just injected our own entry points (index.js / handler.py)
+            
+            self.logging.info("Building container base image...")
             _, container_uri = self.container_client.build_base_image(
                 directory,
                 language_name,
@@ -423,7 +560,10 @@ bucket_name = "{bucket_name}"
             )
             return (directory, 0, container_uri)
         
-        else:
+        # ==============================================================================
+        # PATH B: STANDARD DEPLOYMENT (Original Logic)
+        # ==============================================================================
+         else:
             # Install dependencies
             if language_name == "nodejs":
                 # Ensure Wrangler is installed
@@ -619,7 +759,6 @@ bucket_name = "{bucket_name}"
             self.logging.info(f"Worker package size: {mbytes:.2f} MB (Python: missing vendored modules)")
 
             return (directory, total_size, "")
-
     def create_function(
         self,
         code_package: Benchmark,
@@ -997,91 +1136,86 @@ bucket_name = "{bucket_name}"
         self, worker_name: str, build_dir: str, container_uri: str
     ):
         """
-        Deploys a container-based worker using `wrangler`.
-        
-        This function generates a loader script and a wrangler.toml,
-        then executes `wrangler deploy`.
-        Args:
-            worker_name: The name for the worker.
-            build_dir: The build context directory (where Dockerfile is).
-            container_uri: The full URI of the pushed container image.
+        Deploys a container worker with a clean, minimal configuration.
+        Uses a unique class name to avoid migration conflicts (Error 10074).
         """
         self.logging.info(f"Deploying container {container_uri} to worker {worker_name}")
 
-        # Ensure account ID is available for TOML generation
         account_id = self.config.credentials.account_id
-        # The Durable Object class name used in the SeBS boilerplate for NoSQL/stateful storage.
-        EXPECTED_DO_CLASS = "KVApiObject"
-        # The binding name used in loader.js for the container/DO instance.
-        CONTAINER_BINDING_NAME = "MY_CONTAINER"
-        DO_BINDING_NAME = "DURABLE_STORE" # <-- This name is used in loader.js for access
+        
+        # Generate a unique class name for this deployment
+        # This ensures we start with a fresh Durable Object every time,
+        # avoiding "Class already exists" errors and inheriting the correct CPU limits.
+        import time
+        unique_ts = int(time.time())
+        DO_CLASS = f"BenchmarkEngine_{unique_ts}" 
+        DO_BINDING = "BENCHMARK_DO"
 
-        # 1. Generate wrangler.toml
-        # This TOML now contains the correct bindings for the container image 
-        # to interface as a Durable Object.
+        # -----------------------------------------------------------------------
+        # STEP 1: Minimal Wrangler TOML
+        # -----------------------------------------------------------------------
         toml_content = f"""
-    name = "{worker_name}"
-    main = "loader.js"
-    compatibility_date = "2025-01-01" # Keep recent date for best JS support
-    account_id = "{account_id}"
+name = "{worker_name}"
+main = "loader.js"
+compatibility_date = "2024-09-23"
+account_id = "{account_id}"
 
-    # 1. CONTAINER IMPLEMENTATION BINDING
-    [container_workers."{EXPECTED_DO_CLASS}"]
-    image = "{container_uri}"
+# Bind the Container Image to the Class
+[container_workers."{DO_CLASS}"]
+image = "{container_uri}"
 
-    # 2. WORKER BINDING (INTERFACE)
-    [[durable_objects.bindings]]
-    name = "{DO_BINDING_NAME}"
-    class_name = "{EXPECTED_DO_CLASS}"
+# Bind the Worker to the Class
+[[durable_objects.bindings]]
+name = "{DO_BINDING}"
+class_name = "{DO_CLASS}"
 
-    # 3. MIGRATIONS (FIX FOR 1101 & 10074)
-    [[migrations]]
-    tag = "v6_final_fix" # USE A NEW TAG HERE (e.g., v6_final_fix)
-    # Configure the max_cpu_time for the existing DO class
-    classes = [
-        {{ name = "{EXPECTED_DO_CLASS}", max_cpu_time = 30 }}
-    ]
-    # Use changed_sqlite_classes to update the existing DO class
-    changed_sqlite_classes = ["{EXPECTED_DO_CLASS}"]
-    """
+# Create the Class with 30s CPU limit
+[[migrations]]
+tag = "v{unique_ts}"
+new_sqlite_classes = ["{DO_CLASS}"]
+
+[migrations.options]
+max_cpu_time = 30
+"""
         toml_path = os.path.join(build_dir, "wrangler.toml")
         with open(toml_path, "w") as f:
             f.write(toml_content)
 
-        # 2. Generate loader.js entrypoint script
-        # NOTE: The loader.js logic is now consistent with the DO_BINDING_NAME = "DURABLE_STORE"
-        EXPECTED_DO_CLASS = "KVApiObject"
+        # -----------------------------------------------------------------------
+        # STEP 2: Minimal Loader JS
+        # -----------------------------------------------------------------------
         loader_content = f"""
-// 1. Export the Durable Object Class (required by Wrangler binding)
-// The actual implementation is provided by the container image via wrangler.toml.
-export class {EXPECTED_DO_CLASS} {{
+// 1. Export the Class Definition
+export class {DO_CLASS} {{
     constructor(state, env) {{}}
 }}
 
-// 2. Export the Worker's Fetch Handler (required by Cloudflare runtime)
+// 2. Export the Fetch Handler
+// Routes traffic to the persistent Durable Object instance
 export default {{
     async fetch(request, env, ctx) {{
-        const container = env.{DO_BINDING_NAME}.getByName("instance");
-        
-        // Forward the original request to the container's fetch method
-        // NOTE: The container's internal server must handle the SEBS request format!
+        // Use a fixed ID ("default") to reuse the same container instance
+        const id = env.{DO_BINDING}.idFromName("default");
+        const stub = env.{DO_BINDING}.get(id);
+
         try {{
-            return container.fetch(request);
+            return await stub.fetch(request);
         }} catch (e) {{
-            // Catch errors during invocation/routing and return a meaningful HTTP 500
-            console.error("Durable Object invocation failed:", e);
-            return new Response(`Durable Object invocation failed: ${{e.message}}`, {{ status: 500 }});
+            return new Response("Loader Error: " + e.message, {{ status: 500 }});
         }}
-    }},
+    }}
 }};
 """
         loader_path = os.path.join(build_dir, "loader.js")
         with open(loader_path, "w") as f:
             f.write(loader_content)
-        # 3. Execute Deployment with Wrangler (unchanged)
+
+        # -----------------------------------------------------------------------
+        # STEP 3: Deploy
+        # -----------------------------------------------------------------------
         api_token = self.config.credentials.api_token
         if not api_token:
-            raise RuntimeError("Cloudflare API token is required to deploy with wrangler.")
+            raise RuntimeError("Cloudflare API token is required.")
 
         push_env = os.environ.copy()
         push_env["CLOUDFLARE_API_TOKEN"] = api_token
@@ -1093,27 +1227,18 @@ export default {{
             process = subprocess.run(
                 cmd,
                 env=push_env,
-                cwd=build_dir, # Run from the build directory
+                cwd=build_dir,
                 check=True,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
             )
-            self.logging.info(f"Wrangler deploy stdout: {process.stdout}")
             self.logging.info(f"Successfully deployed container worker {worker_name}")
+            self.logging.debug(process.stdout)
 
         except subprocess.CalledProcessError as e:
-            self.logging.error(f"Failed to deploy container worker {worker_name} with wrangler.")
-            self.logging.error(f"Wrangler return code: {e.returncode}")
-            self.logging.error(f"Wrangler stdout: {e.stdout}")
-            self.logging.error(f"Wrangler stderr: {e.stderr}")
-            raise RuntimeError(f"Wrangler deploy failed: {e.stderr}")
-        except FileNotFoundError:
-            self.logging.error("`wrangler` command not found.")
-            raise RuntimeError(
-                "`wrangler` CLI is not installed or not in PATH. "
-                "It is required for Cloudflare container operations."
-            )
+            self.logging.error(f"Wrangler deploy failed.\nSTDOUT: {e.stdout}\nSTDERR: {e.stderr}")
+            raise RuntimeError(f"Wrangler deploy failed: {e.stderr}")        
     def default_function_name(self, code_package: Benchmark, resources=None) -> str:
         """
         Generate a default function name for Cloudflare Workers.
