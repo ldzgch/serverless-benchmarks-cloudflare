@@ -285,7 +285,7 @@ name = "{DO_BINDING_NAME}"
 class_name = "KVApiObject"
 
 [[migrations]]
-tag = "v1"
+tag = "v2"
 new_classes = ["KVApiObject"]
 """
 
@@ -676,7 +676,7 @@ bucket_name = "{bucket_name}"
             worker = CloudflareWorker(
                  func_name,
                  code_package.benchmark,
-                 func_name,  # script_id is the same as name
+                
                  func_name,
                  code_package.hash,
                  language_runtime,
@@ -685,7 +685,7 @@ bucket_name = "{bucket_name}"
              )
             self.update_function(worker, code_package, container_deployment, container_uri)
             worker.updated_code = True
-            worker.updated_code = True # We always update containers
+            return worker
         else:
 
             # Check if worker already exists
@@ -704,6 +704,7 @@ bucket_name = "{bucket_name}"
                 )
                 self.update_function(worker, code_package, container_deployment, container_uri)
                 worker.updated_code = True
+                return worker
             else:
                 self.logging.info(f"Creating new worker {func_name}")
 
@@ -925,17 +926,30 @@ bucket_name = "{bucket_name}"
         Args:
             function: Existing function instance to update
             code_package: New benchmark containing the function code
-            container_deployment: Whether to deploy as container (not supported)
-            container_uri: URI of container image (not used)
+            container_deployment: Whether to deploy as container
+            container_uri: URI of container image
         """
+        # --- IF CONTAINER DEPLOYMENT ---
         if container_deployment:
+            print(f" COntainer_deployment function to update: {function}")
+            worker = cast(CloudflareWorker, function)
+            
+            # These variables are only used for logging/context, not deployment flow
+            # package = code_package.code_location 
+            # language = code_package.language_name
+            # benchmark = code_package.benchmark
+            
             self.logging.info(f"Updating container worker {worker.name}")
             build_dir = code_package.code_location
+            
             if not container_uri:
                 raise RuntimeError("container_uri is required for container deployment")
 
+            # CALLS THE FIXED HELPER FUNCTION
             self._deploy_container_worker(worker.name, build_dir, container_uri)
             self.logging.info(f"Updated container worker {worker.name}")
+        
+        # --- ELSE (STANDARD WORKER DEPLOYMENT) ---
         else:
             worker = cast(CloudflareWorker, function)
             package = code_package.code_location
@@ -997,61 +1011,74 @@ bucket_name = "{bucket_name}"
         # Ensure account ID is available for TOML generation
         account_id = self.config.credentials.account_id
         # The Durable Object class name used in the SeBS boilerplate for NoSQL/stateful storage.
-        EXPECTED_DO_CLASS = "KVApiObject" 
+        EXPECTED_DO_CLASS = "KVApiObject"
         # The binding name used in loader.js for the container/DO instance.
-        CONTAINER_BINDING_NAME = "MY_CONTAINER" 
-        DO_BINDING_NAME = "DURABLE_STORE"
+        CONTAINER_BINDING_NAME = "MY_CONTAINER"
+        DO_BINDING_NAME = "DURABLE_STORE" # <-- This name is used in loader.js for access
 
         # 1. Generate wrangler.toml
         # This TOML now contains the correct bindings for the container image 
         # to interface as a Durable Object.
         toml_content = f"""
-name = "{worker_name}"
-main = "loader.js"
-compatibility_date = "2024-05-01"
-account_id = "{account_id}"
+    name = "{worker_name}"
+    main = "loader.js"
+    compatibility_date = "2025-01-01" # Keep recent date for best JS support
+    account_id = "{account_id}"
 
-[[containers]]
-class_name = "{EXPECTED_DO_CLASS}" # Binds the container image to the DO class
-image = "{container_uri}"
+    # 1. CONTAINER IMPLEMENTATION BINDING
+    [container_workers."{EXPECTED_DO_CLASS}"]
+    image = "{container_uri}"
 
-# Durable Object Definition (Defines the class interface)
-[[durable_objects.bindings]]
-name = "{CONTAINER_BINDING_NAME}" # 🟢 FIX: Ensure loader.js binding name is used here
-class_name = "{EXPECTED_DO_CLASS}"
+    # 2. WORKER BINDING (INTERFACE)
+    [[durable_objects.bindings]]
+    name = "{DO_BINDING_NAME}"
+    class_name = "{EXPECTED_DO_CLASS}"
 
-[[migrations]]
-tag = "v1"
-new_classes = ["{EXPECTED_DO_CLASS}"]
-"""
+    # 3. MIGRATIONS (FIX FOR 1101 & 10074)
+    [[migrations]]
+    tag = "v6_final_fix" # USE A NEW TAG HERE (e.g., v6_final_fix)
+    # Configure the max_cpu_time for the existing DO class
+    classes = [
+        {{ name = "{EXPECTED_DO_CLASS}", max_cpu_time = 30 }}
+    ]
+    # Use changed_sqlite_classes to update the existing DO class
+    changed_sqlite_classes = ["{EXPECTED_DO_CLASS}"]
+    """
         toml_path = os.path.join(build_dir, "wrangler.toml")
         with open(toml_path, "w") as f:
             f.write(toml_content)
 
         # 2. Generate loader.js entrypoint script
-        # FIX: Use the variable CONTAINER_BINDING_NAME in the loader template.
-        EXPECTED_DO_CLASS = "KVApiObject" 
+        # NOTE: The loader.js logic is now consistent with the DO_BINDING_NAME = "DURABLE_STORE"
+        EXPECTED_DO_CLASS = "KVApiObject"
         loader_content = f"""
-        // Dummy class for Durable Object export required by Wrangler when using a DO binding.
-        // The actual implementation is provided by the container image.
-        export class {EXPECTED_DO_CLASS} {{
-            constructor(state, env) {{}}
-        }}
+// 1. Export the Durable Object Class (required by Wrangler binding)
+// The actual implementation is provided by the container image via wrangler.toml.
+export class {EXPECTED_DO_CLASS} {{
+    constructor(state, env) {{}}
+}}
 
-        export default {{
-        async fetch(request, env, ctx) {{
-            // env.DURABLE_STORE must be replaced with the actual binding name (DURABLE_STORE).
-            const container = env.DURABLE_STORE.getByName("instance"); 
-            // Forward the original request to the container
+// 2. Export the Worker's Fetch Handler (required by Cloudflare runtime)
+export default {{
+    async fetch(request, env, ctx) {{
+        const container = env.{DO_BINDING_NAME}.getByName("instance");
+        
+        // Forward the original request to the container's fetch method
+        // NOTE: The container's internal server must handle the SEBS request format!
+        try {{
             return container.fetch(request);
-        }},
-        }};
-        """
+        }} catch (e) {{
+            // Catch errors during invocation/routing and return a meaningful HTTP 500
+            console.error("Durable Object invocation failed:", e);
+            return new Response(`Durable Object invocation failed: ${{e.message}}`, {{ status: 500 }});
+        }}
+    }},
+}};
+"""
         loader_path = os.path.join(build_dir, "loader.js")
         with open(loader_path, "w") as f:
             f.write(loader_content)
-
-        # 3. Execute Deployment with Wrangler
+        # 3. Execute Deployment with Wrangler (unchanged)
         api_token = self.config.credentials.api_token
         if not api_token:
             raise RuntimeError("Cloudflare API token is required to deploy with wrangler.")
@@ -1087,7 +1114,6 @@ new_classes = ["{EXPECTED_DO_CLASS}"]
                 "`wrangler` CLI is not installed or not in PATH. "
                 "It is required for Cloudflare container operations."
             )
-        
     def default_function_name(self, code_package: Benchmark, resources=None) -> str:
         """
         Generate a default function name for Cloudflare Workers.
