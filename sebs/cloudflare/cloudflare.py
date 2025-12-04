@@ -281,7 +281,7 @@ compatibility_flags = ["python_workers"]
 
         toml_content += """
 [[durable_objects.bindings]]
-name = "DURABLE_STORE"
+name = "{DO_BINDING_NAME}"
 class_name = "KVApiObject"
 
 [[migrations]]
@@ -379,6 +379,12 @@ bucket_name = "{bucket_name}"
             Tuple of (package_path, package_size, container_uri)
         """
         self.logging.info(f"running package_code.")
+        self._ensure_wrangler_installed()
+        if self.system_config.supported_container_deployment(self.name()):
+        # If the platform supports containers, and we are expecting one, force it.
+            container_deployment = True 
+            self.logging.info(f"Forcing container_deployment=True in package_code.")
+
         self.logging.info(f"you would never believe that: {container_deployment}")
         if container_deployment:
             SERVER_FILES = {
@@ -988,43 +994,71 @@ bucket_name = "{bucket_name}"
         """
         self.logging.info(f"Deploying container {container_uri} to worker {worker_name}")
 
+        # Ensure account ID is available for TOML generation
+        account_id = self.config.credentials.account_id
+        # The Durable Object class name used in the SeBS boilerplate for NoSQL/stateful storage.
+        EXPECTED_DO_CLASS = "KVApiObject" 
+        # The binding name used in loader.js for the container/DO instance.
+        CONTAINER_BINDING_NAME = "MY_CONTAINER" 
+        DO_BINDING_NAME = "DURABLE_STORE"
+
         # 1. Generate wrangler.toml
-        #    Note: We use a fixed compatibility date. This could be configurable.
+        # This TOML now contains the correct bindings for the container image 
+        # to interface as a Durable Object.
         toml_content = f"""
 name = "{worker_name}"
 main = "loader.js"
 compatibility_date = "2024-05-01"
+account_id = "{account_id}"
+
 [[containers]]
-class_name = "Worker"  # or the class you want
+class_name = "{EXPECTED_DO_CLASS}" # Binds the container image to the DO class
 image = "{container_uri}"
+
+# Durable Object Definition (Defines the class interface)
+[[durable_objects.bindings]]
+name = "{CONTAINER_BINDING_NAME}" # 🟢 FIX: Ensure loader.js binding name is used here
+class_name = "{EXPECTED_DO_CLASS}"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["{EXPECTED_DO_CLASS}"]
 """
         toml_path = os.path.join(build_dir, "wrangler.toml")
         with open(toml_path, "w") as f:
             f.write(toml_content)
 
         # 2. Generate loader.js entrypoint script
-        #    This script forwards requests to the container.
-        loader_content = """
-export default {
-  async fetch(request, env, ctx) {
-    // getByName("instance") creates/gets a proxy to the container instance
-    const container = env.MY_CONTAINER.getByName("instance");
-    // Forward the original request to the container
-    return container.fetch(request);
-  },
-};
-"""
+        # FIX: Use the variable CONTAINER_BINDING_NAME in the loader template.
+        EXPECTED_DO_CLASS = "KVApiObject" 
+        loader_content = f"""
+        // Dummy class for Durable Object export required by Wrangler when using a DO binding.
+        // The actual implementation is provided by the container image.
+        export class {EXPECTED_DO_CLASS} {{
+            constructor(state, env) {{}}
+        }}
+
+        export default {{
+        async fetch(request, env, ctx) {{
+            // env.DURABLE_STORE must be replaced with the actual binding name (DURABLE_STORE).
+            const container = env.DURABLE_STORE.getByName("instance"); 
+            // Forward the original request to the container
+            return container.fetch(request);
+        }},
+        }};
+        """
         loader_path = os.path.join(build_dir, "loader.js")
         with open(loader_path, "w") as f:
             f.write(loader_content)
 
-        # 3. Get API token for wrangler
+        # 3. Execute Deployment with Wrangler
         api_token = self.config.credentials.api_token
         if not api_token:
             raise RuntimeError("Cloudflare API token is required to deploy with wrangler.")
 
         push_env = os.environ.copy()
         push_env["CLOUDFLARE_API_TOKEN"] = api_token
+        push_env['CLOUDFLARE_ACCOUNT_ID'] = account_id
 
         cmd = ["wrangler", "deploy"]
 
@@ -1053,7 +1087,7 @@ export default {
                 "`wrangler` CLI is not installed or not in PATH. "
                 "It is required for Cloudflare container operations."
             )
-
+        
     def default_function_name(self, code_package: Benchmark, resources=None) -> str:
         """
         Generate a default function name for Cloudflare Workers.
