@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 
 # Usage:
 # source run_experiment <benchmark> <lang> <exp_type> <size> [<parallel_invocations>] 
@@ -7,7 +7,14 @@
 OUTPUT_DIR=cloudflare-results/$1/$2/$3/reps_$4
 FIG_DIR=cloudflare-results/fig/$1/
 CONFIG_NAME=config/generated/cloudflare-config.json
-LANG_VERSION=$(($2 == "python" ? "3.11" : "18"))
+PYTHON_VERSION="3.11"
+NODEJS_VERSION="18"
+
+if [[ $2 == "python" ]]; then
+  LANG_VERSION="3.11"
+else 
+  LANG_VERSION="18"
+fi
 
 mkdir -p config/generated
 
@@ -29,8 +36,8 @@ tee $CONFIG_NAME << EndOfText
       "benchmark": "$1",
       "experiments": ["$3"],
       "input-size": "test",
-      "repetitions": "100",
-      "concurrent-invocations": "${5:-10}",
+      "repetitions": $4,
+      "concurrent-invocations": ${5:-10},
       "memory-sizes": [128]
     }
   },
@@ -46,8 +53,8 @@ EndOfText
 mkdir -p $OUTPUT_DIR 
 
 source .env 
-./sebs.py experiment invoke perf-cost --config config/cloudflare-test.json --output-dir $OUTPUT_DIR 
+./sebs.py experiment invoke perf-cost --config $CONFIG_NAME --output-dir $OUTPUT_DIR 
 
 mkdir -p $FIG_DIR
 
-python3 useful_results.py $OUTPUT_DIR/perf-cost/$3_results_128.json test_image
+python3 useful_results.py $OUTPUT_DIR/perf-cost/$3_results_128.json
