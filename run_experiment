@@ -1,14 +1,13 @@
 #!/bin/bash
 
 # Usage:
-# source run_experiment <benchmark> <lang> <exp_type> <size> [<parallel_invocations>] 
+# source run_experiment <benchmark> <lang> <exp_type> <size> <platform> [<parallel_invocations>] 
 #
 
 OUTPUT_DIR=cloudflare-results/$1/$2/$3/reps_$4
 FIG_DIR=cloudflare-results/fig/$1/
 CONFIG_NAME=config/generated/cloudflare-config.json
-PYTHON_VERSION="3.11"
-NODEJS_VERSION="18"
+PLATFORM=$5
 
 if [[ $2 == "python" ]]; then
   LANG_VERSION="3.11"
@@ -37,7 +36,7 @@ tee $CONFIG_NAME << EndOfText
       "experiments": ["$3"],
       "input-size": "test",
       "repetitions": $4,
-      "concurrent-invocations": ${5:-10},
+      "concurrent-invocations": ${6:-10},
       "memory-sizes": [128]
     }
   },
