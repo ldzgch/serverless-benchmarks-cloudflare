@@ -106,13 +106,10 @@ class SeBS(LoggingBase):
             from sebs.openwhisk import OpenWhisk
 
             implementations["openwhisk"] = OpenWhisk
-        
-        # Cloudflare is available by default (like local)
-        try:
+        if has_platform("cloudflare"):
             from sebs.cloudflare import Cloudflare
+
             implementations["cloudflare"] = Cloudflare
-        except ImportError:
-            pass
 
         if name not in implementations:
             raise RuntimeError("Deployment {name} not supported!".format(name=name))
