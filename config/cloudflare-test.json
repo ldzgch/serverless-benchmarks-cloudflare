@@ -7,8 +7,8 @@
     "architecture": "x64",
     "container_deployment": false,
     "runtime": {
-      "language": "nodejs",
-      "version": "18"
+      "language": "python",
+      "version": "3.11"
     }
   },
   "deployment": {

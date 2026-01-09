@@ -173,6 +173,7 @@ class PerfCost(Experiment):
                     incorrect = []
                     for res in results:
                         try:
+                            assert res
                             ret = res.get()
                             if first_iteration:
                                 continue

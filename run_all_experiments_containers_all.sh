@@ -6,10 +6,12 @@
 # Don't use set -e to allow cleanup to continue even if some commands fail
 
 # Array of benchmark numbers
-BENCHMARKS=(110 120 130 210 220 311 411 501 502 503 504)
+#BENCHMARKS=(110 120 130 210 220 311 411 501 502 503 504)
+BENCHMARKS=(502 503)
 
 # Array of languages
-LANGUAGES=(python nodejs)
+#LANGUAGES=(python nodejs)
+LANGUAGES=(python)
 
 # Output directory
 OUTPUT_DIR="results"

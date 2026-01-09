@@ -1,0 +1,17 @@
+{
+  "object": {
+    "type": "minio",
+    "minio": {
+      "address": "localhost:9011",
+      "mapped_port": 9011,
+      "access_key": "cXeOCltsro4A84SZFR9u3_OQQoHHJ6QsA3vEcCFIGuA",
+      "secret_key": "3ec53bf80c067dd8c8c8dbd9ec33d60a29acf0a11c92a2481aa1a600597c0097",
+      "instance_id": "30193a1262a797629b325ee38589d4f4359019b7f70a0c80e2ddb27b3348c1f9",
+      "output_buckets": [],
+      "input_buckets": [],
+      "version": "RELEASE.2024-07-16T23-46-41Z",
+      "data_volume": "minio-volume",
+      "type": "minio"
+    }
+  }
+}

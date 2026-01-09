@@ -1131,9 +1131,11 @@ dev = [
             # Increase timeout for large container images (e.g., 411.image-recognition with PyTorch)
             # Container deployment requires pushing large images to Cloudflare
             deploy_timeout = 1200 if container_deployment else 180  # 20 minutes for containers, 3 for native
-            
+            cmdl = [wrangler_cmd, "deploy"]
+            if container_deployment:
+                cmdl.append("--containers-rollout=immediate")
             result = subprocess.run(
-                [wrangler_cmd, "deploy"],
+                cmdl,
                 cwd=package_dir,
                 env=env,
                 capture_output=True,
